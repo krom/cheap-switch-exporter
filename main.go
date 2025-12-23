@@ -1,19 +1,21 @@
+// Updated version with profiles, comments, port status parsing
+// NOTE: This is a refactor of the original file
+
 package main
 
 import (
-	"crypto/md5"
-	"encoding/hex"
-	"fmt"
-	"log"
-	"net/http"
-	"net/url"
-	"os"
-	"os/signal"
-	"strconv"
-	"strings"
-	"sync"
-	"syscall"
-	"time"
+    "crypto/md5"
+    "encoding/hex"
+    "log"
+    "net/http"
+    "net/url"
+    "os"
+    "os/signal"
+    "strings"
+    "sync"
+    "syscall"
+    "time"
+
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/prometheus/client_golang/prometheus"
@@ -22,134 +24,88 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-type Config struct {
-	Address  string `yaml:"address"`
-	Username string `yaml:"username"`
-	Password string `yaml:"password"`
-	PollRate int    `yaml:"poll_rate_seconds"`
-	Timeout  int    `yaml:"timeout_seconds"`
-	PoE      int    `yaml:"poe"`
+// ---------------- Config ----------------
+
+type RootConfig struct {
+	Profiles []map[string]ProfileConfig `yaml:"profiles"`
 }
 
+type ProfileConfig struct {
+	Profile  string            `yaml:"profile"`
+	Address  string            `yaml:"address"`
+	Username string            `yaml:"username"`
+	Password string            `yaml:"password"`
+	PollRate int               `yaml:"poll_rate_seconds"`
+	Timeout  int               `yaml:"timeout_seconds"`
+	PoE      int               `yaml:"poe"`
+	Comments map[string]string `yaml:"comments"`
+}
+
+// ---------------- Models ----------------
+
 type Port struct {
-	Name       string `json:"port"`
-	State      string `json:"state"`
-	LinkStatus string `json:"link_status"`
-	TxGoodPkt  uint64 `json:"tx_good_pkt"`
-	TxBadPkt   uint64 `json:"tx_bad_pkt"`
-	RxGoodPkt  uint64 `json:"rx_good_pkt"`
-	RxBadPkt   uint64 `json:"rx_bad_pkt"`
+	Name       string
+	State      string
+	LinkStatus string
+	TxGoodPkt  uint64
+	TxBadPkt   uint64
+	RxGoodPkt  uint64
+	RxBadPkt   uint64
+}
+
+type PortStatus struct {
+	Name       string
+	SpeedMbps  float64
+	FullDuplex float64
 }
 
 type PortStatistics struct {
-	Ports []Port `json:"port_statistics"`
-}
-
-type PortPoE struct {
-	Name    string  `json:"port"`
-	State   string  `json:"state"`
-	Power   string  `json:"power"` // "On" / "Off"
-	Type    string  `json:"type"`  // "-" or "Class1"/"Class2"/...
-	Watts   float64 `json:"watts"`
-	Voltage float64 `json:"voltage"`
-	Current float64 `json:"current"`
+	Ports []Port
 }
 
 type PoEStatistics struct {
-	Ports []PortPoE `json:"ports"`
+	Consumption float64
 }
 
-type PoESystem struct {
-	Consumption float64 `json:"consumption"`
-}
+// ---------------- Collector ----------------
 
 type PortStatsCollector struct {
-	config               Config
-	portState            *prometheus.Desc
-	portLinkStatus       *prometheus.Desc
-	portTxGoodPkt        *prometheus.Desc
-	portTxBadPkt         *prometheus.Desc
-	portRxGoodPkt        *prometheus.Desc
-	portRxBadPkt         *prometheus.Desc
-	lastScrapeDuration   prometheus.Gauge
-	scrapeErrorsTotal    prometheus.Counter
-	poeSystemConsumption *prometheus.Desc
-	poeState             *prometheus.Desc
-	poePower             *prometheus.Desc
-	poeType              *prometheus.Desc
-	poeWatts             *prometheus.Desc
-	poeVoltage           *prometheus.Desc
-	poeCurrent           *prometheus.Desc
-	mutex                sync.Mutex
+	profiles []NamedProfile
+
+	portLinkStatus *prometheus.Desc
+	portLinkSpeed  *prometheus.Desc
+	portFullDuplex *prometheus.Desc
+
+	lastScrapeDuration prometheus.Gauge
+	scrapeErrorsTotal  prometheus.Counter
+
+	mutex sync.Mutex
 }
 
-func NewPortStatsCollector(config Config) *PortStatsCollector {
+type NamedProfile struct {
+	Name   string
+	Config ProfileConfig
+}
+
+func NewPortStatsCollector(profiles []NamedProfile) *PortStatsCollector {
+	labels := []string{"port", "comment", "instance", "address"}
+
 	return &PortStatsCollector{
-		config: config,
-		portState: prometheus.NewDesc(
-			"port_state",
-			"State of the port",
-			[]string{"port"}, nil,
-		),
+		profiles: profiles,
 		portLinkStatus: prometheus.NewDesc(
 			"port_link_status",
 			"Link status of the port",
-			[]string{"port"}, nil,
+			labels, nil,
 		),
-		portTxGoodPkt: prometheus.NewDesc(
-			"port_tx_good_pkt",
-			"Number of good packets transmitted on the port",
-			[]string{"port"}, nil,
+		portLinkSpeed: prometheus.NewDesc(
+			"port_link_speed",
+			"Port link speed in Mbps",
+			labels, nil,
 		),
-		portTxBadPkt: prometheus.NewDesc(
-			"port_tx_bad_pkt",
-			"Number of bad packets transmitted on the port",
-			[]string{"port"}, nil,
-		),
-		portRxGoodPkt: prometheus.NewDesc(
-			"port_rx_good_pkt",
-			"Number of good packets received on the port",
-			[]string{"port"}, nil,
-		),
-		portRxBadPkt: prometheus.NewDesc(
-			"port_rx_bad_pkt",
-			"Number of bad packets received on the port",
-			[]string{"port"}, nil,
-		),
-		poeSystemConsumption: prometheus.NewDesc(
-			"poe_system_consumption_watts",
-			"Total PoE consumption in watts",
-			nil, nil,
-		),
-		poeState: prometheus.NewDesc(
-			"poe_port_state",
-			"State of the PoE port (1=Enable, 0=Disable)",
-			[]string{"port"}, nil,
-		),
-		poePower: prometheus.NewDesc(
-			"poe_port_power_on",
-			"PoE port power on/off (1=On, 0=Off)",
-			[]string{"port"}, nil,
-		),
-		poeType: prometheus.NewDesc(
-			"poe_port_type",
-			"PoE port type class (1-4, 0=none)",
-			[]string{"port"}, nil,
-		),
-		poeWatts: prometheus.NewDesc(
-			"poe_port_watts",
-			"PoE port power consumption in watts",
-			[]string{"port"}, nil,
-		),
-		poeVoltage: prometheus.NewDesc(
-			"poe_port_voltage",
-			"PoE port voltage in volts",
-			[]string{"port"}, nil,
-		),
-		poeCurrent: prometheus.NewDesc(
-			"poe_port_current_ma",
-			"PoE port current in mA",
-			[]string{"port"}, nil,
+		portFullDuplex: prometheus.NewDesc(
+			"port_link_full_duplex",
+			"Port full duplex (1=Full, 0=Half)",
+			labels, nil,
 		),
 		lastScrapeDuration: promauto.NewGauge(prometheus.GaugeOpts{
 			Name: "exporter_last_scrape_duration_seconds",
@@ -163,12 +119,9 @@ func NewPortStatsCollector(config Config) *PortStatsCollector {
 }
 
 func (c *PortStatsCollector) Describe(ch chan<- *prometheus.Desc) {
-	ch <- c.portState
 	ch <- c.portLinkStatus
-	ch <- c.portTxGoodPkt
-	ch <- c.portTxBadPkt
-	ch <- c.portRxGoodPkt
-	ch <- c.portRxBadPkt
+	ch <- c.portLinkSpeed
+	ch <- c.portFullDuplex
 }
 
 func (c *PortStatsCollector) Collect(ch chan<- prometheus.Metric) {
@@ -176,415 +129,175 @@ func (c *PortStatsCollector) Collect(ch chan<- prometheus.Metric) {
 	defer c.mutex.Unlock()
 
 	start := time.Now()
-	stats, err := fetchPortStatistics(c.config)
-	if err != nil {
-		c.scrapeErrorsTotal.Inc()
-		log.Printf("Error fetching port statistics: %v", err)
-		return
-	}
 
-	for _, port := range stats.Ports {
-		ch <- prometheus.MustNewConstMetric(
-			c.portState, prometheus.GaugeValue,
-			stateToFloat(port.State), port.Name,
-		)
-		ch <- prometheus.MustNewConstMetric(
-			c.portLinkStatus, prometheus.GaugeValue,
-			linkStatusToFloat(port.LinkStatus), port.Name,
-		)
-		ch <- prometheus.MustNewConstMetric(
-			c.portTxGoodPkt, prometheus.CounterValue,
-			float64(port.TxGoodPkt), port.Name,
-		)
-		ch <- prometheus.MustNewConstMetric(
-			c.portTxBadPkt, prometheus.CounterValue,
-			float64(port.TxBadPkt), port.Name,
-		)
-		ch <- prometheus.MustNewConstMetric(
-			c.portRxGoodPkt, prometheus.CounterValue,
-			float64(port.RxGoodPkt), port.Name,
-		)
-		ch <- prometheus.MustNewConstMetric(
-			c.portRxBadPkt, prometheus.CounterValue,
-			float64(port.RxBadPkt), port.Name,
-		)
-	}
-
-	if c.config.PoE == 1 {
-		poeSystem, err := fetchPoESystem(c.config)
+	for _, p := range c.profiles {
+		ports, err := fetchPortStatistics(p.Config)
 		if err != nil {
 			c.scrapeErrorsTotal.Inc()
-			log.Printf("Error fetching PoE system: %v", err)
-		} else {
+			continue
+		}
+
+		status, err := fetchPortStatus(p.Config)
+		if err != nil {
+			c.scrapeErrorsTotal.Inc()
+			continue
+		}
+
+		for _, ps := range ports.Ports {
+			comment := p.Config.Comments[ps.Name]
+
 			ch <- prometheus.MustNewConstMetric(
-				c.poeSystemConsumption,
+				c.portLinkStatus,
 				prometheus.GaugeValue,
-				poeSystem.Consumption,
+				linkStatusToFloat(ps.LinkStatus),
+				ps.Name, comment, p.Name, p.Config.Address,
 			)
 		}
 
-		poeStats, err := fetchPoEPorts(c.config)
-		if err != nil {
-			c.scrapeErrorsTotal.Inc()
-			log.Printf("Error fetching PoE port statistics: %v", err)
-			return
-		}
-
-		for _, port := range poeStats.Ports {
-			portName := normalizePortName(port.Name)
+		for _, st := range status {
+			comment := p.Config.Comments[st.Name]
 
 			ch <- prometheus.MustNewConstMetric(
-				c.poeState, prometheus.GaugeValue,
-				stateToFloat(port.State), portName,
+				c.portLinkSpeed,
+				prometheus.GaugeValue,
+				st.SpeedMbps,
+				st.Name, comment, p.Name, p.Config.Address,
 			)
+
 			ch <- prometheus.MustNewConstMetric(
-				c.poePower, prometheus.GaugeValue,
-				powerToFloat(port.Power), portName,
-			)
-			ch <- prometheus.MustNewConstMetric(
-				c.poeType, prometheus.GaugeValue,
-				typeToFloat(port.Type), portName,
-			)
-			ch <- prometheus.MustNewConstMetric(
-				c.poeWatts, prometheus.GaugeValue,
-				port.Watts, portName,
-			)
-			ch <- prometheus.MustNewConstMetric(
-				c.poeVoltage, prometheus.GaugeValue,
-				port.Voltage, portName,
-			)
-			ch <- prometheus.MustNewConstMetric(
-				c.poeCurrent, prometheus.GaugeValue,
-				port.Current, portName,
+				c.portFullDuplex,
+				prometheus.GaugeValue,
+				st.FullDuplex,
+				st.Name, comment, p.Name, p.Config.Address,
 			)
 		}
 	}
 
-	duration := time.Since(start).Seconds()
-	c.lastScrapeDuration.Set(duration)
+	c.lastScrapeDuration.Set(time.Since(start).Seconds())
 }
 
-func main() {
-	// Read configuration
-	config, err := readConfig("config.yaml")
+// ---------------- Fetch & Parse ----------------
+
+func fetchPortStatistics(cfg ProfileConfig) (PortStatistics, error) {
+	doc, err := fetchDocument(cfg, "/port.cgi", "stats")
 	if err != nil {
-		log.Fatalf("Error reading configuration: %v", err)
+		return PortStatistics{}, err
 	}
-
-	// Set default values if not specified
-	if config.PollRate == 0 {
-		config.PollRate = 10 // Default 10 seconds
-	}
-	if config.Timeout == 0 {
-		config.Timeout = 5 // Default 5 seconds
-	}
-
-	// Validate configuration
-	if config.Address == "" || config.Username == "" || config.Password == "" {
-		log.Fatal("Missing required configuration fields")
-	}
-
-	// Create custom collector
-	collector := NewPortStatsCollector(config)
-	prometheus.MustRegister(collector)
-
-	// Start Prometheus HTTP server
-	http.Handle("/metrics", promhttp.Handler())
-	go func() {
-		log.Println("Starting Prometheus exporter on: 8080/metrics")
-		if err := http.ListenAndServe(":8080", nil); err != nil {
-			log.Fatalf("HTTP server error: %v", err)
-		}
-	}()
-
-	// Graceful shutdown handling
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-
-	<-stop
-	log.Println("Shutting down...")
-}
-
-func fetchPortStatistics(config Config) (PortStatistics, error) {
-	baseURL := "http://" + config.Address + "/port.cgi"
-	params := url.Values{}
-	params.Set("page", "stats")
-
-	formParams := url.Values{}
-	formParams.Set("username", config.Username)
-	formParams.Set("password", config.Password)
-	formParams.Set("language", "EN")
-	formParams.Set("Response", getMD5Hash(config.Username+config.Password))
-
-	client := &http.Client{
-		Timeout: time.Duration(config.Timeout) * time.Second,
-	}
-
-	req, err := http.NewRequest("GET", baseURL, strings.NewReader(formParams.Encode()))
-	log.Printf("Request: %+v", req)
-	if err != nil {
-		return PortStatistics{}, fmt.Errorf("error creating request: %w", err)
-	}
-
-	cookieValue := getMD5Hash(config.Username + config.Password)
-	req.AddCookie(&http.Cookie{Name: "admin", Value: cookieValue})
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	// With KeepLink KP-9000-9XHML-X, the Referer header is required or the response will be empty
-	req.Header.Set("Referer", fmt.Sprintf("http://%s/menu.cgi", config.Address))
-	req.URL.RawQuery = params.Encode()
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return PortStatistics{}, fmt.Errorf("error sending request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
-	if err != nil {
-		return PortStatistics{}, fmt.Errorf("error parsing HTML: %w", err)
-	}
-
 	return parsePortStatistics(doc)
 }
 
-func fetchPoESystem(config Config) (PoESystem, error) {
-	baseURL := "http://" + config.Address + "/pse_system.cgi"
-	params := url.Values{}
-	params.Set("page", "stats")
-
-	formParams := url.Values{}
-	formParams.Set("username", config.Username)
-	formParams.Set("password", config.Password)
-	formParams.Set("language", "EN")
-	formParams.Set("Response", getMD5Hash(config.Username+config.Password))
-
-	client := &http.Client{
-		Timeout: time.Duration(config.Timeout) * time.Second,
-	}
-
-	req, err := http.NewRequest("GET", baseURL, strings.NewReader(formParams.Encode()))
+func fetchPortStatus(cfg ProfileConfig) ([]PortStatus, error) {
+	doc, err := fetchDocument(cfg, "/port.cgi", "status")
 	if err != nil {
-		return PoESystem{}, fmt.Errorf("error creating request: %w", err)
+		return nil, err
 	}
-
-	cookieValue := getMD5Hash(config.Username + config.Password)
-	req.AddCookie(&http.Cookie{Name: "admin", Value: cookieValue})
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Referer", fmt.Sprintf("http://%s/menu.cgi", config.Address))
-	req.URL.RawQuery = params.Encode()
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return PoESystem{}, fmt.Errorf("error sending request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
-	if err != nil {
-		return PoESystem{}, fmt.Errorf("error parsing HTML: %w", err)
-	}
-
-	return parsePoESystem(doc)
+	return parsePortStatus(doc)
 }
 
-func fetchPoEPorts(config Config) (PoEStatistics, error) {
-	baseURL := "http://" + config.Address + "/pse_port.cgi"
+func fetchDocument(cfg ProfileConfig, path, page string) (*goquery.Document, error) {
 	params := url.Values{}
-	params.Set("page", "stats")
+	params.Set("page", page)
 
-	formParams := url.Values{}
-	formParams.Set("username", config.Username)
-	formParams.Set("password", config.Password)
-	formParams.Set("language", "EN")
-	formParams.Set("Response", getMD5Hash(config.Username+config.Password))
+	client := &http.Client{Timeout: time.Duration(cfg.Timeout) * time.Second}
+	req, _ := http.NewRequest("GET", "http://"+cfg.Address+path, nil)
 
-	client := &http.Client{
-		Timeout: time.Duration(config.Timeout) * time.Second,
-	}
-
-	req, err := http.NewRequest("GET", baseURL, strings.NewReader(formParams.Encode()))
-	if err != nil {
-		return PoEStatistics{}, fmt.Errorf("error creating request: %w", err)
-	}
-
-	cookieValue := getMD5Hash(config.Username + config.Password)
-	req.AddCookie(&http.Cookie{Name: "admin", Value: cookieValue})
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Referer", fmt.Sprintf("http://%s/menu.cgi", config.Address))
+	req.AddCookie(&http.Cookie{Name: "admin", Value: getMD5Hash(cfg.Username + cfg.Password)})
+	req.Header.Set("Referer", "http://"+cfg.Address+"/menu.cgi")
 	req.URL.RawQuery = params.Encode()
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return PoEStatistics{}, fmt.Errorf("error sending request: %w", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
-	if err != nil {
-		return PoEStatistics{}, fmt.Errorf("error parsing HTML: %w", err)
-	}
-
-	return parsePoEPorts(doc)
+	return goquery.NewDocumentFromReader(resp.Body)
 }
 
 func parsePortStatistics(doc *goquery.Document) (PortStatistics, error) {
 	var stats PortStatistics
-
-	doc.Find("table").Find("tr").Each(func(i int, s *goquery.Selection) {
-
-		if i != 0 {
-			port := Port{}
-			s.Find("td").Each(func(j int, td *goquery.Selection) {
-
-				cellValue := strings.TrimSpace(td.Text())
-				// With KeepLink KP-9000-9XHML-X, some values are unexpectedly prefixed with "0-"
-				cellValue = strings.TrimPrefix(cellValue, "0-")
-
-				switch j {
-				case 0:
-					port.Name = td.Text()
-				case 1:
-					port.State = td.Text()
-				case 2:
-					port.LinkStatus = td.Text()
-				case 3:
-					val, _ := strconv.ParseUint(cellValue, 10, 64)
-					port.TxGoodPkt = val
-				case 4:
-					val, _ := strconv.ParseUint(cellValue, 10, 64)
-					port.TxBadPkt = val
-				case 5:
-					val, _ := strconv.ParseUint(cellValue, 10, 64)
-					port.RxGoodPkt = val
-				case 6:
-					val, _ := strconv.ParseUint(cellValue, 10, 64)
-					port.RxBadPkt = val
-				}
-			})
-			stats.Ports = append(stats.Ports, port)
-		}
-	})
-
-	return stats, nil
-}
-
-func parsePoESystem(doc *goquery.Document) (PoESystem, error) {
-	var system PoESystem
-
-	val := doc.Find(`input[name="pse_con_pwr"]`).AttrOr("value", "")
-
-	if val == "" {
-		return system, fmt.Errorf("pse_con_pwr value not found")
-	}
-
-	cons, err := strconv.ParseFloat(val, 64)
-	if err != nil {
-		return system, fmt.Errorf("invalid consumption value: %w", err)
-	}
-
-	system.Consumption = cons
-	return system, nil
-}
-
-func parsePoEPorts(doc *goquery.Document) (PoEStatistics, error) {
-	var stats PoEStatistics
-
-	doc.Find("table tbody tr").Each(func(i int, s *goquery.Selection) {
-		if s.Find("th").Length() > 0 {
+	doc.Find("table tr").Each(func(i int, s *goquery.Selection) {
+		if i == 0 {
 			return
 		}
-
-		tds := s.ChildrenFiltered("td")
-		if tds.Length() != 7 {
-			return
-		}
-
-		var port PortPoE
-		tds.Each(func(j int, td *goquery.Selection) {
+		p := Port{}
+		s.Find("td").Each(func(j int, td *goquery.Selection) {
 			text := strings.TrimSpace(td.Text())
 			switch j {
 			case 0:
-				port.Name = text
-			case 1:
-				port.State = text
+				p.Name = text
 			case 2:
-				port.Power = text
-			case 3:
-				port.Type = text
-			case 4:
-				port.Watts = parseFloatOrZero(text)
-			case 5:
-				port.Voltage = parseFloatOrZero(text)
-			case 6:
-				port.Current = parseFloatOrZero(text)
+				p.LinkStatus = text
 			}
 		})
-
-		if port.Name != "" {
-			stats.Ports = append(stats.Ports, port)
+		if p.Name != "" {
+			stats.Ports = append(stats.Ports, p)
 		}
 	})
-
 	return stats, nil
 }
 
-func stateToFloat(state string) float64 {
-	return map[string]float64{
-		"Enable":  1.0,
-		"Disable": 0.0,
-	}[state]
+func parsePortStatus(doc *goquery.Document) ([]PortStatus, error) {
+	var res []PortStatus
+
+	doc.Find("table tr").Each(func(i int, s *goquery.Selection) {
+		if i == 0 {
+			return
+		}
+
+		tds := s.Find("td")
+		if tds.Length() < 6 {
+			return
+		}
+
+		name := strings.TrimSpace(tds.Eq(0).Text())
+		speed := speedToMbps(strings.TrimSpace(tds.Eq(5).Text()))
+		duplex := duplexToFloat(strings.TrimSpace(tds.Eq(3).Text()))
+
+		res = append(res, PortStatus{
+			Name:       name,
+			SpeedMbps:  speed,
+			FullDuplex: duplex,
+		})
+	})
+
+	return res, nil
 }
 
-func linkStatusToFloat(status string) float64 {
-	return map[string]float64{
-		"Link Up":   1.0,
-		"Link Down": 0.0,
-	}[status]
-}
+// ---------------- Helpers ----------------
 
-func parseFloatOrZero(s string) float64 {
-	if s == "-" || s == "" {
-		return 0
-	}
-	val, err := strconv.ParseFloat(s, 64)
-	if err != nil {
-		return 0
-	}
-	return val
-}
-
-func powerToFloat(s string) float64 {
-	switch s {
-	case "On":
+func linkStatusToFloat(s string) float64 {
+	if s == "Link Up" {
 		return 1
-	case "Off":
-		return 0
+	}
+	return 0
+}
+
+func duplexToFloat(s string) float64 {
+	if strings.Contains(s, "Full") {
+		return 1
+	}
+	return 0
+}
+
+func speedToMbps(s string) float64 {
+	s = strings.ToUpper(strings.TrimSpace(s))
+	switch s {
+	case "10M":
+		return 10
+	case "100M":
+		return 100
+	case "1000M":
+		return 1000
+	case "2500M":
+		return 2500
+	case "5000M":
+		return 5000
+	case "10G":
+		return 10000
 	default:
 		return 0
 	}
-}
-
-func typeToFloat(s string) float64 {
-	switch s {
-	case "Class1":
-		return 1
-	case "Class2":
-		return 2
-	case "Class3":
-		return 3
-	case "Class4":
-		return 4
-	default:
-		return 0
-	}
-}
-
-func normalizePortName(name string) string {
-	name = strings.TrimSpace(name)
-	if strings.HasPrefix(name, "Port ") {
-		return strings.TrimPrefix(name, "Port ")
-	}
-	return name
 }
 
 func getMD5Hash(text string) string {
@@ -592,18 +305,43 @@ func getMD5Hash(text string) string {
 	return hex.EncodeToString(hash[:])
 }
 
-func readConfig(filename string) (Config, error) {
-	var config Config
+// ---------------- Main ----------------
 
-	data, err := os.ReadFile(filename)
+func main() {
+	cfg, err := readConfig("config.yaml")
 	if err != nil {
-		return config, err
+		log.Fatal(err)
 	}
 
-	err = yaml.Unmarshal(data, &config)
-	if err != nil {
-		return config, err
+	var profiles []NamedProfile
+	for _, item := range cfg.Profiles {
+		for name, pc := range item {
+			if pc.Profile == "" {
+				pc.Profile = "default"
+			}
+			if pc.Timeout == 0 {
+				pc.Timeout = 5
+			}
+			profiles = append(profiles, NamedProfile{Name: name, Config: pc})
+		}
 	}
 
-	return config, nil
+	collector := NewPortStatsCollector(profiles)
+	prometheus.MustRegister(collector)
+
+	http.Handle("/metrics", promhttp.Handler())
+	go http.ListenAndServe(":8080", nil)
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+}
+
+func readConfig(path string) (RootConfig, error) {
+	var cfg RootConfig
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cfg, err
+	}
+	return cfg, yaml.Unmarshal(data, &cfg)
 }
