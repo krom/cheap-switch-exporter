@@ -88,7 +88,7 @@ type NamedProfile struct {
 }
 
 func NewPortStatsCollector(profiles []NamedProfile) *PortStatsCollector {
-	labels := []string{"port", "comment", "instance", "address"}
+	labels := []string{"port", "comment", "switch", "address"}
 
 	return &PortStatsCollector{
 		profiles: profiles,
