@@ -1,21 +1,20 @@
-// Updated version with profiles, comments, port status parsing
-// NOTE: This is a refactor of the original file
+// Final unified exporter with full metrics restored
 
 package main
 
 import (
-    "crypto/md5"
-    "encoding/hex"
-    "log"
-    "net/http"
-    "net/url"
-    "os"
-    "os/signal"
-    "strings"
-    "sync"
-    "syscall"
-    "time"
-
+	"crypto/md5"
+	"encoding/hex"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/prometheus/client_golang/prometheus"
@@ -24,7 +23,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// ---------------- Config ----------------
+// ================= CONFIG =================
 
 type RootConfig struct {
 	Profiles []map[string]ProfileConfig `yaml:"profiles"`
@@ -35,22 +34,26 @@ type ProfileConfig struct {
 	Address  string            `yaml:"address"`
 	Username string            `yaml:"username"`
 	Password string            `yaml:"password"`
-	PollRate int               `yaml:"poll_rate_seconds"`
 	Timeout  int               `yaml:"timeout_seconds"`
 	PoE      int               `yaml:"poe"`
 	Comments map[string]string `yaml:"comments"`
 }
 
-// ---------------- Models ----------------
+type NamedProfile struct {
+	Name   string
+	Config ProfileConfig
+}
+
+// ================= MODELS =================
 
 type Port struct {
 	Name       string
 	State      string
 	LinkStatus string
-	TxGoodPkt  uint64
-	TxBadPkt   uint64
-	RxGoodPkt  uint64
-	RxBadPkt   uint64
+	TxGood     float64
+	TxBad      float64
+	RxGood     float64
+	RxBad      float64
 }
 
 type PortStatus struct {
@@ -59,274 +62,260 @@ type PortStatus struct {
 	FullDuplex float64
 }
 
-type PortStatistics struct {
-	Ports []Port
+type PoEPort struct {
+	Name    string
+	State   float64
+	Power   float64
+	Type    float64
+	Watts   float64
+	Voltage float64
+	Current float64
 }
 
-type PoEStatistics struct {
-	Consumption float64
-}
-
-// ---------------- Collector ----------------
+// ================= COLLECTOR =================
 
 type PortStatsCollector struct {
 	profiles []NamedProfile
 
-	portLinkStatus *prometheus.Desc
-	portLinkSpeed  *prometheus.Desc
+	portState      *prometheus.Desc
+	portLink       *prometheus.Desc
+	portTxGood     *prometheus.Desc
+	portTxBad      *prometheus.Desc
+	portRxGood     *prometheus.Desc
+	portRxBad      *prometheus.Desc
+	portSpeed      *prometheus.Desc
 	portFullDuplex *prometheus.Desc
 
-	lastScrapeDuration prometheus.Gauge
-	scrapeErrorsTotal  prometheus.Counter
+	poeSystem *prometheus.Desc
+	poeState  *prometheus.Desc
+	poePower  *prometheus.Desc
+	poeType   *prometheus.Desc
+	poeWatts  *prometheus.Desc
+	poeVolt   *prometheus.Desc
+	poeCurr   *prometheus.Desc
 
-	mutex sync.Mutex
+	lastScrape prometheus.Gauge
+	errors     prometheus.Counter
+
+	mu sync.Mutex
 }
 
-type NamedProfile struct {
-	Name   string
-	Config ProfileConfig
-}
-
-func NewPortStatsCollector(profiles []NamedProfile) *PortStatsCollector {
-	labels := []string{"port", "comment", "switch", "address"}
+func NewCollector(p []NamedProfile) *PortStatsCollector {
+	labels := []string{"port", "comment", "instance", "address"}
 
 	return &PortStatsCollector{
-		profiles: profiles,
-		portLinkStatus: prometheus.NewDesc(
-			"port_link_status",
-			"Link status of the port",
-			labels, nil,
-		),
-		portLinkSpeed: prometheus.NewDesc(
-			"port_link_speed",
-			"Port link speed in Mbps",
-			labels, nil,
-		),
-		portFullDuplex: prometheus.NewDesc(
-			"port_link_full_duplex",
-			"Port full duplex (1=Full, 0=Half)",
-			labels, nil,
-		),
-		lastScrapeDuration: promauto.NewGauge(prometheus.GaugeOpts{
-			Name: "exporter_last_scrape_duration_seconds",
-			Help: "Duration of the last scrape",
-		}),
-		scrapeErrorsTotal: promauto.NewCounter(prometheus.CounterOpts{
-			Name: "exporter_scrape_errors_total",
-			Help: "Total number of scrape errors",
-		}),
+		profiles: p,
+		portState: prometheus.NewDesc("port_state", "Port admin state", labels, nil),
+		portLink:  prometheus.NewDesc("port_link_status", "Link up/down", labels, nil),
+		portTxGood: prometheus.NewDesc("port_tx_good_pkt", "TX good packets", labels, nil),
+		portTxBad:  prometheus.NewDesc("port_tx_bad_pkt", "TX bad packets", labels, nil),
+		portRxGood: prometheus.NewDesc("port_rx_good_pkt", "RX good packets", labels, nil),
+		portRxBad:  prometheus.NewDesc("port_rx_bad_pkt", "RX bad packets", labels, nil),
+		portSpeed: prometheus.NewDesc("port_link_speed", "Link speed Mbps", labels, nil),
+		portFullDuplex: prometheus.NewDesc("port_link_full_duplex", "Full duplex", labels, nil),
+
+		poeSystem: prometheus.NewDesc("poe_system_consumption_watts", "Total PoE consumption", nil, nil),
+		poeState:  prometheus.NewDesc("poe_port_state", "PoE port enabled", labels, nil),
+		poePower:  prometheus.NewDesc("poe_port_power_on", "PoE power on", labels, nil),
+		poeType:   prometheus.NewDesc("poe_port_type", "PoE class", labels, nil),
+		poeWatts:  prometheus.NewDesc("poe_port_watts", "PoE watts", labels, nil),
+		poeVolt:   prometheus.NewDesc("poe_port_voltage", "PoE voltage", labels, nil),
+		poeCurr:   prometheus.NewDesc("poe_port_current_ma", "PoE current", labels, nil),
+
+		lastScrape: promauto.NewGauge(prometheus.GaugeOpts{Name: "exporter_last_scrape_duration_seconds"}),
+		errors:     promauto.NewCounter(prometheus.CounterOpts{Name: "exporter_scrape_errors_total"}),
 	}
 }
 
 func (c *PortStatsCollector) Describe(ch chan<- *prometheus.Desc) {
-	ch <- c.portLinkStatus
-	ch <- c.portLinkSpeed
+	ch <- c.portState
+	ch <- c.portLink
+	ch <- c.portTxGood
+	ch <- c.portTxBad
+	ch <- c.portRxGood
+	ch <- c.portRxBad
+	ch <- c.portSpeed
 	ch <- c.portFullDuplex
+	ch <- c.poeSystem
+	ch <- c.poeState
+	ch <- c.poePower
+	ch <- c.poeType
+	ch <- c.poeWatts
+	ch <- c.poeVolt
+	ch <- c.poeCurr
 }
 
 func (c *PortStatsCollector) Collect(ch chan<- prometheus.Metric) {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	start := time.Now()
 
 	for _, p := range c.profiles {
-		ports, err := fetchPortStatistics(p.Config)
+		ports, err := fetchPorts(p.Config)
 		if err != nil {
-			c.scrapeErrorsTotal.Inc()
-			continue
+			c.errors.Inc(); continue
+		}
+		status, _ := fetchPortStatus(p.Config)
+		statusMap := map[string]PortStatus{}
+		for _, s := range status { statusMap[s.Name] = s }
+
+		for _, pt := range ports {
+			comment := p.Config.Comments[pt.Name]
+			labels := []string{pt.Name, comment, p.Name, p.Config.Address}
+
+			ch <- prometheus.MustNewConstMetric(c.portState, prometheus.GaugeValue, state(pt.State), labels...)
+			ch <- prometheus.MustNewConstMetric(c.portLink, prometheus.GaugeValue, link(pt.LinkStatus), labels...)
+			ch <- prometheus.MustNewConstMetric(c.portTxGood, prometheus.CounterValue, pt.TxGood, labels...)
+			ch <- prometheus.MustNewConstMetric(c.portTxBad, prometheus.CounterValue, pt.TxBad, labels...)
+			ch <- prometheus.MustNewConstMetric(c.portRxGood, prometheus.CounterValue, pt.RxGood, labels...)
+			ch <- prometheus.MustNewConstMetric(c.portRxBad, prometheus.CounterValue, pt.RxBad, labels...)
+
+			if st, ok := statusMap[pt.Name]; ok {
+				ch <- prometheus.MustNewConstMetric(c.portSpeed, prometheus.GaugeValue, st.SpeedMbps, labels...)
+				ch <- prometheus.MustNewConstMetric(c.portFullDuplex, prometheus.GaugeValue, st.FullDuplex, labels...)
+			}
 		}
 
-		status, err := fetchPortStatus(p.Config)
-		if err != nil {
-			c.scrapeErrorsTotal.Inc()
-			continue
-		}
-
-		for _, ps := range ports.Ports {
-			comment := p.Config.Comments[ps.Name]
-
-			ch <- prometheus.MustNewConstMetric(
-				c.portLinkStatus,
-				prometheus.GaugeValue,
-				linkStatusToFloat(ps.LinkStatus),
-				ps.Name, comment, p.Name, p.Config.Address,
-			)
-		}
-
-		for _, st := range status {
-			comment := p.Config.Comments[st.Name]
-
-			ch <- prometheus.MustNewConstMetric(
-				c.portLinkSpeed,
-				prometheus.GaugeValue,
-				st.SpeedMbps,
-				st.Name, comment, p.Name, p.Config.Address,
-			)
-
-			ch <- prometheus.MustNewConstMetric(
-				c.portFullDuplex,
-				prometheus.GaugeValue,
-				st.FullDuplex,
-				st.Name, comment, p.Name, p.Config.Address,
-			)
+		if p.Config.PoE == 1 {
+			cons, poePorts, err := fetchPoE(p.Config)
+			if err == nil {
+				ch <- prometheus.MustNewConstMetric(c.poeSystem, prometheus.GaugeValue, cons)
+				for _, pp := range poePorts {
+					comment := p.Config.Comments[pp.Name]
+					labels := []string{pp.Name, comment, p.Name, p.Config.Address}
+					ch <- prometheus.MustNewConstMetric(c.poeState, prometheus.GaugeValue, pp.State, labels...)
+					ch <- prometheus.MustNewConstMetric(c.poePower, prometheus.GaugeValue, pp.Power, labels...)
+					ch <- prometheus.MustNewConstMetric(c.poeType, prometheus.GaugeValue, pp.Type, labels...)
+					ch <- prometheus.MustNewConstMetric(c.poeWatts, prometheus.GaugeValue, pp.Watts, labels...)
+					ch <- prometheus.MustNewConstMetric(c.poeVolt, prometheus.GaugeValue, pp.Voltage, labels...)
+					ch <- prometheus.MustNewConstMetric(c.poeCurr, prometheus.GaugeValue, pp.Current, labels...)
+				}
+			}
 		}
 	}
 
-	c.lastScrapeDuration.Set(time.Since(start).Seconds())
+	c.lastScrape.Set(time.Since(start).Seconds())
 }
 
-// ---------------- Fetch & Parse ----------------
+// ================= FETCH / PARSE =================
 
-func fetchPortStatistics(cfg ProfileConfig) (PortStatistics, error) {
-	doc, err := fetchDocument(cfg, "/port.cgi", "stats")
-	if err != nil {
-		return PortStatistics{}, err
-	}
-	return parsePortStatistics(doc)
-}
-
-func fetchPortStatus(cfg ProfileConfig) ([]PortStatus, error) {
-	doc, err := fetchDocument(cfg, "/port.cgi", "status")
-	if err != nil {
-		return nil, err
-	}
-	return parsePortStatus(doc)
-}
-
-func fetchDocument(cfg ProfileConfig, path, page string) (*goquery.Document, error) {
-	params := url.Values{}
-	params.Set("page", page)
-
+func fetchDoc(cfg ProfileConfig, path, page string) (*goquery.Document, error) {
 	client := &http.Client{Timeout: time.Duration(cfg.Timeout) * time.Second}
 	req, _ := http.NewRequest("GET", "http://"+cfg.Address+path, nil)
-
-	req.AddCookie(&http.Cookie{Name: "admin", Value: getMD5Hash(cfg.Username + cfg.Password)})
+	req.URL.RawQuery = url.Values{"page": {page}}.Encode()
+	req.AddCookie(&http.Cookie{Name: "admin", Value: md5hex(cfg.Username + cfg.Password)})
 	req.Header.Set("Referer", "http://"+cfg.Address+"/menu.cgi")
-	req.URL.RawQuery = params.Encode()
-
 	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
+	if err != nil { return nil, err }
 	defer resp.Body.Close()
-
 	return goquery.NewDocumentFromReader(resp.Body)
 }
 
-func parsePortStatistics(doc *goquery.Document) (PortStatistics, error) {
-	var stats PortStatistics
+func fetchPorts(cfg ProfileConfig) ([]Port, error) {
+	doc, err := fetchDoc(cfg, "/port.cgi", "stats")
+	if err != nil { return nil, err }
+	var res []Port
 	doc.Find("table tr").Each(func(i int, s *goquery.Selection) {
-		if i == 0 {
-			return
-		}
-		p := Port{}
-		s.Find("td").Each(func(j int, td *goquery.Selection) {
-			text := strings.TrimSpace(td.Text())
-			switch j {
-			case 0:
-				p.Name = text
-			case 2:
-				p.LinkStatus = text
-			}
-		})
-		if p.Name != "" {
-			stats.Ports = append(stats.Ports, p)
-		}
-	})
-	return stats, nil
-}
-
-func parsePortStatus(doc *goquery.Document) ([]PortStatus, error) {
-	var res []PortStatus
-
-	doc.Find("table tr").Each(func(i int, s *goquery.Selection) {
-		if i == 0 {
-			return
-		}
-
+		if i == 0 { return }
 		tds := s.Find("td")
-		if tds.Length() < 6 {
-			return
-		}
-
-		name := strings.TrimSpace(tds.Eq(0).Text())
-		speed := speedToMbps(strings.TrimSpace(tds.Eq(5).Text()))
-		duplex := duplexToFloat(strings.TrimSpace(tds.Eq(3).Text()))
-
-		res = append(res, PortStatus{
-			Name:       name,
-			SpeedMbps:  speed,
-			FullDuplex: duplex,
+		if tds.Length() < 7 { return }
+		res = append(res, Port{
+			Name: tds.Eq(0).Text(),
+			State: tds.Eq(1).Text(),
+			LinkStatus: tds.Eq(2).Text(),
+			TxGood: parseNum(tds.Eq(3).Text()),
+			TxBad:  parseNum(tds.Eq(4).Text()),
+			RxGood: parseNum(tds.Eq(5).Text()),
+			RxBad:  parseNum(tds.Eq(6).Text()),
 		})
 	})
-
 	return res, nil
 }
 
-// ---------------- Helpers ----------------
-
-func linkStatusToFloat(s string) float64 {
-	if s == "Link Up" {
-		return 1
-	}
-	return 0
+func fetchPortStatus(cfg ProfileConfig) ([]PortStatus, error) {
+	doc, err := fetchDoc(cfg, "/port.cgi", "status")
+	if err != nil { return nil, err }
+	var res []PortStatus
+	doc.Find("table tr").Each(func(i int, s *goquery.Selection) {
+		if i == 0 { return }
+		tds := s.Find("td")
+		if tds.Length() < 6 { return }
+		res = append(res, PortStatus{
+			Name: tds.Eq(0).Text(),
+			SpeedMbps: speed(tds.Eq(5).Text()),
+			FullDuplex: duplex(tds.Eq(3).Text()),
+		})
+	})
+	return res, nil
 }
 
-func duplexToFloat(s string) float64 {
-	if strings.Contains(s, "Full") {
-		return 1
-	}
-	return 0
+func fetchPoE(cfg ProfileConfig) (float64, []PoEPort, error) {
+	docSys, err := fetchDoc(cfg, "/pse_system.cgi", "stats")
+	if err != nil { return 0, nil, err }
+	cons := parseNum(docSys.Find(`input[name="pse_con_pwr"]`).AttrOr("value", "0"))
+
+	doc, err := fetchDoc(cfg, "/pse_port.cgi", "stats")
+	if err != nil { return 0, nil, err }
+
+	var ports []PoEPort
+	doc.Find("table tbody tr").Each(func(_ int, s *goquery.Selection) {
+		tds := s.Find("td")
+		if tds.Length() != 7 { return }
+		ports = append(ports, PoEPort{
+			Name: tds.Eq(0).Text(),
+			State: state(tds.Eq(1).Text()),
+			Power: onoff(tds.Eq(2).Text()),
+			Type: poeType(tds.Eq(3).Text()),
+			Watts: parseNum(tds.Eq(4).Text()),
+			Voltage: parseNum(tds.Eq(5).Text()),
+			Current: parseNum(tds.Eq(6).Text()),
+		})
+	})
+
+	return cons, ports, nil
 }
 
-func speedToMbps(s string) float64 {
+// ================= HELPERS =================
+
+func state(s string) float64 { if strings.Contains(s, "Enable") { return 1 }; return 0 }
+func link(s string) float64 { if strings.Contains(s, "Up") { return 1 }; return 0 }
+func duplex(s string) float64 { if strings.Contains(s, "Full") { return 1 }; return 0 }
+func onoff(s string) float64 { if s == "On" { return 1 }; return 0 }
+func poeType(s string) float64 { switch s { case "Class1": return 1; case "Class2": return 2; case "Class3": return 3; case "Class4": return 4 }; return 0 }
+
+func speed(s string) float64 {
 	s = strings.ToUpper(strings.TrimSpace(s))
-	switch s {
-	case "10M":
-		return 10
-	case "100M":
-		return 100
-	case "1000M":
-		return 1000
-	case "2500M":
-		return 2500
-	case "5000M":
-		return 5000
-	case "10G":
-		return 10000
-	default:
-		return 0
-	}
+	switch s { case "10M": return 10; case "100M": return 100; case "1000M": return 1000; case "2500M": return 2500; case "5000M": return 5000; case "10G": return 10000 }
+	return 0
 }
 
-func getMD5Hash(text string) string {
-	hash := md5.Sum([]byte(text))
-	return hex.EncodeToString(hash[:])
+func parseNum(s string) float64 {
+	s = strings.TrimSpace(strings.TrimPrefix(s, "0-"))
+	if s == "" || s == "-" { return 0 }
+	v, _ := strconv.ParseFloat(s, 64)
+	return v
 }
 
-// ---------------- Main ----------------
+func md5hex(s string) string { h := md5.Sum([]byte(s)); return hex.EncodeToString(h[:]) }
+
+// ================= MAIN =================
 
 func main() {
-	cfg, err := readConfig("config.yaml")
-	if err != nil {
-		log.Fatal(err)
-	}
+	cfg := RootConfig{}
+	b, err := os.ReadFile("config.yaml")
+	if err != nil { log.Fatal(err) }
+	if err := yaml.Unmarshal(b, &cfg); err != nil { log.Fatal(err) }
 
 	var profiles []NamedProfile
-	for _, item := range cfg.Profiles {
-		for name, pc := range item {
-			if pc.Profile == "" {
-				pc.Profile = "default"
-			}
-			if pc.Timeout == 0 {
-				pc.Timeout = 5
-			}
+	for _, m := range cfg.Profiles {
+		for name, pc := range m {
+			if pc.Timeout == 0 { pc.Timeout = 5 }
 			profiles = append(profiles, NamedProfile{Name: name, Config: pc})
 		}
 	}
 
-	collector := NewPortStatsCollector(profiles)
+	collector := NewCollector(profiles)
 	prometheus.MustRegister(collector)
 
 	http.Handle("/metrics", promhttp.Handler())
@@ -335,13 +324,4 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
-}
-
-func readConfig(path string) (RootConfig, error) {
-	var cfg RootConfig
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return cfg, err
-	}
-	return cfg, yaml.Unmarshal(data, &cfg)
 }
