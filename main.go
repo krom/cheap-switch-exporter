@@ -46,14 +46,52 @@ type NamedProfile struct {
 
 // ================= MODELS =================
 
+// CounterKind identifies one of the 8 Tx/Rx x Good/Bad x Pkt/Bytes counter columns a
+// switch's port.cgi?page=stats table may report. Its string value is also the exact
+// header text used to recognize that column, e.g. <th>TxGoodPkt</th>.
+type CounterKind string
+
+const (
+	TxGoodPkt   CounterKind = "TxGoodPkt"
+	TxBadPkt    CounterKind = "TxBadPkt"
+	TxGoodBytes CounterKind = "TxGoodBytes"
+	TxBadBytes  CounterKind = "TxBadBytes"
+	RxGoodPkt   CounterKind = "RxGoodPkt"
+	RxBadPkt    CounterKind = "RxBadPkt"
+	RxGoodBytes CounterKind = "RxGoodBytes"
+	RxBadBytes  CounterKind = "RxBadBytes"
+)
+
+var counterMetricNames = map[CounterKind]string{
+	TxGoodPkt:   "port_tx_good_pkt",
+	TxBadPkt:    "port_tx_bad_pkt",
+	TxGoodBytes: "port_tx_good_bytes",
+	TxBadBytes:  "port_tx_bad_bytes",
+	RxGoodPkt:   "port_rx_good_pkt",
+	RxBadPkt:    "port_rx_bad_pkt",
+	RxGoodBytes: "port_rx_good_bytes",
+	RxBadBytes:  "port_rx_bad_bytes",
+}
+
+var counterMetricHelp = map[CounterKind]string{
+	TxGoodPkt:   "TX good packets",
+	TxBadPkt:    "TX bad packets",
+	TxGoodBytes: "TX good bytes",
+	TxBadBytes:  "TX bad bytes",
+	RxGoodPkt:   "RX good packets",
+	RxBadPkt:    "RX bad packets",
+	RxGoodBytes: "RX good bytes",
+	RxBadBytes:  "RX bad bytes",
+}
+
 type Port struct {
 	Name       string
 	State      string
 	LinkStatus string
-	TxGood     float64
-	TxBad      float64
-	RxGood     float64
-	RxBad      float64
+	// Counters holds only the counter kinds this switch's page actually reported;
+	// a kind absent here was not present in the table header, and must not be
+	// emitted (not even as 0).
+	Counters map[CounterKind]float64
 }
 
 type PortStatus struct {
@@ -79,10 +117,7 @@ type PortStatsCollector struct {
 
 	portState      *prometheus.Desc
 	portLink       *prometheus.Desc
-	portTxGood     *prometheus.Desc
-	portTxBad      *prometheus.Desc
-	portRxGood     *prometheus.Desc
-	portRxBad      *prometheus.Desc
+	portCounters   map[CounterKind]*prometheus.Desc
 	portSpeed      *prometheus.Desc
 	portFullDuplex *prometheus.Desc
 
@@ -103,14 +138,16 @@ type PortStatsCollector struct {
 func NewCollector(p []NamedProfile) *PortStatsCollector {
 	labels := []string{"port", "comment", "switch", "address"}
 
+	portCounters := map[CounterKind]*prometheus.Desc{}
+	for kind, name := range counterMetricNames {
+		portCounters[kind] = prometheus.NewDesc(name, counterMetricHelp[kind], labels, nil)
+	}
+
 	return &PortStatsCollector{
 		profiles:       p,
 		portState:      prometheus.NewDesc("port_state", "Port admin state", labels, nil),
 		portLink:       prometheus.NewDesc("port_link_status", "Link up/down", labels, nil),
-		portTxGood:     prometheus.NewDesc("port_tx_good_pkt", "TX good packets", labels, nil),
-		portTxBad:      prometheus.NewDesc("port_tx_bad_pkt", "TX bad packets", labels, nil),
-		portRxGood:     prometheus.NewDesc("port_rx_good_pkt", "RX good packets", labels, nil),
-		portRxBad:      prometheus.NewDesc("port_rx_bad_pkt", "RX bad packets", labels, nil),
+		portCounters:   portCounters,
 		portSpeed:      prometheus.NewDesc("port_link_speed", "Link speed Mbps", labels, nil),
 		portFullDuplex: prometheus.NewDesc("port_link_full_duplex", "Full duplex", labels, nil),
 
@@ -130,10 +167,9 @@ func NewCollector(p []NamedProfile) *PortStatsCollector {
 func (c *PortStatsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.portState
 	ch <- c.portLink
-	ch <- c.portTxGood
-	ch <- c.portTxBad
-	ch <- c.portRxGood
-	ch <- c.portRxBad
+	for _, desc := range c.portCounters {
+		ch <- desc
+	}
 	ch <- c.portSpeed
 	ch <- c.portFullDuplex
 	ch <- c.poeSystem
@@ -169,10 +205,9 @@ func (c *PortStatsCollector) Collect(ch chan<- prometheus.Metric) {
 
 			ch <- prometheus.MustNewConstMetric(c.portState, prometheus.GaugeValue, state(pt.State), labels...)
 			ch <- prometheus.MustNewConstMetric(c.portLink, prometheus.GaugeValue, link(pt.LinkStatus), labels...)
-			ch <- prometheus.MustNewConstMetric(c.portTxGood, prometheus.CounterValue, pt.TxGood, labels...)
-			ch <- prometheus.MustNewConstMetric(c.portTxBad, prometheus.CounterValue, pt.TxBad, labels...)
-			ch <- prometheus.MustNewConstMetric(c.portRxGood, prometheus.CounterValue, pt.RxGood, labels...)
-			ch <- prometheus.MustNewConstMetric(c.portRxBad, prometheus.CounterValue, pt.RxBad, labels...)
+			for kind, v := range pt.Counters {
+				ch <- prometheus.MustNewConstMetric(c.portCounters[kind], prometheus.CounterValue, v, labels...)
+			}
 
 			if st, ok := statusMap[pt.Name]; ok {
 				ch <- prometheus.MustNewConstMetric(c.portSpeed, prometheus.GaugeValue, st.SpeedMbps, labels...)
@@ -223,23 +258,31 @@ func fetchPorts(cfg ProfileConfig) ([]Port, error) {
 		return nil, err
 	}
 	var res []Port
+	columnKinds := map[int]CounterKind{}
 	doc.Find("table tr").Each(func(i int, s *goquery.Selection) {
 		if i == 0 {
+			s.Find("th").Each(func(col int, th *goquery.Selection) {
+				kind := CounterKind(strings.TrimSpace(th.Text()))
+				if _, ok := counterMetricNames[kind]; ok {
+					columnKinds[col] = kind
+				}
+			})
 			return
 		}
 		tds := s.Find("td")
-		if tds.Length() < 7 {
+		if tds.Length() < 3+len(columnKinds) {
 			return
 		}
-		res = append(res, Port{
+		pt := Port{
 			Name:       tds.Eq(0).Text(),
 			State:      tds.Eq(1).Text(),
 			LinkStatus: tds.Eq(2).Text(),
-			TxGood:     parseNum(tds.Eq(3).Text()),
-			TxBad:      parseNum(tds.Eq(4).Text()),
-			RxGood:     parseNum(tds.Eq(5).Text()),
-			RxBad:      parseNum(tds.Eq(6).Text()),
-		})
+			Counters:   map[CounterKind]float64{},
+		}
+		for col, kind := range columnKinds {
+			pt.Counters[kind] = parseNum(tds.Eq(col).Text())
+		}
+		res = append(res, pt)
 	})
 	return res, nil
 }
@@ -358,10 +401,20 @@ func speed(s string) float64 {
 	return 0
 }
 
+// parseNum parses a table cell's numeric text. Some switch firmware splits a 64-bit
+// counter into two 32-bit halves joined by "-" (e.g. "1-901525430"), recombined by the
+// page's own JS as high*4294967296 + low; recombine the same way here.
 func parseNum(s string) float64 {
-	s = strings.TrimSpace(strings.TrimPrefix(s, "0-"))
+	s = strings.TrimSpace(s)
 	if s == "" || s == "-" {
 		return 0
+	}
+	if high, low, ok := strings.Cut(s, "-"); ok {
+		if hv, err := strconv.ParseUint(high, 10, 64); err == nil {
+			if lv, err := strconv.ParseUint(low, 10, 64); err == nil {
+				return float64(hv*4294967296 + lv)
+			}
+		}
 	}
 	v, _ := strconv.ParseFloat(s, 64)
 	return v

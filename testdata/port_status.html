@@ -1,0 +1,42 @@
+<!-- Synthetic fixture for fetchPortStatus tests. Not captured from a real switch;
+     built to match fetchPortStatus's current column assumptions (Name at column 0,
+     Duplex at column 3, Speed at column 5). If a real capture is ever added (as
+     examples/*.html were for port.cgi?page=stats), prefer that instead. -->
+<html>
+<body>
+<table>
+	<tr>
+		<th>Port</th>
+		<th>State</th>
+		<th>Link Status</th>
+		<th>Duplex</th>
+		<th>Flow Control</th>
+		<th>Speed</th>
+	</tr>
+	<tr>
+		<td>Port 1</td>
+		<td>Enable</td>
+		<td>Link Up</td>
+		<td>Full</td>
+		<td>Off</td>
+		<td>1000M</td>
+	</tr>
+	<tr>
+		<td>Port 2</td>
+		<td>Enable</td>
+		<td>Link Up</td>
+		<td>Half</td>
+		<td>Off</td>
+		<td>100M</td>
+	</tr>
+	<tr>
+		<td>Port 3</td>
+		<td>Enable</td>
+		<td>Link Up</td>
+		<td>Full</td>
+		<td>Off</td>
+		<td>10G</td>
+	</tr>
+</table>
+</body>
+</html>

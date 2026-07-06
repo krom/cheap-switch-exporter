@@ -60,15 +60,31 @@ docker run -v "./config.yaml:/config.yaml" -p 8080:8080 cheap-switch-exporter
 
 ## 📝 Configuration
 
-Create a `config.yaml` with the following structure:
+`config.yaml` defines a `profiles:` list. Each entry is a single-key map from a profile
+name (used as the `switch` label in metrics) to that profile's settings, so one exporter
+instance can poll multiple physical switches at once:
 
 ```yaml
-address: "192.168.1.1"           # IP or hostname of the switch
-username: "admin"                # Web interface username
-password: "password"             # Web interface password
-poll_rate_seconds: 10            # Metrics polling interval
-timeout_seconds: 5               # Request timeout
-poe: 0                           # Enable PoE page scrape
+profiles:
+  - desk_switch:                   # profile name -> used as the "switch" label
+      address: "192.168.1.1"       # IP or hostname of the switch
+      username: "admin"            # Web interface username
+      password: "password"         # Web interface password
+      timeout_seconds: 5           # Request timeout (defaults to 5 if omitted)
+      poe: 0                       # Enable PoE page scrape (1 = enabled)
+      comments:                    # Optional per-port labels, keyed by port name
+        Port 1: Port 1
+        Port 2: Port 2
+        Port 6: Core Switch
+
+  - core_switch:                   # add more profiles to monitor more switches
+      address: "192.168.1.2"
+      username: "admin"
+      password: "password"
+      timeout_seconds: 5
+      poe: 1
+      comments:
+        Port 1: Uplink
 ```
 
 ## 📊 Exposed Metrics
@@ -79,6 +95,14 @@ poe: 0                           # Enable PoE page scrape
 - `port_tx_bad_pkt`: Transmitted bad packets
 - `port_rx_good_pkt`: Received good packets
 - `port_rx_bad_pkt`: Received bad packets
+- `port_tx_good_bytes`: Transmitted good bytes
+- `port_tx_bad_bytes`: Transmitted bad bytes
+- `port_rx_good_bytes`: Received good bytes
+- `port_rx_bad_bytes`: Received bad bytes
+
+Not every switch model reports all 8 counters above — only the ones present on that
+switch's page are exposed (e.g. some models report packet counts only, others report a mix
+of packet and byte counts).
 
 ### PoE metrics (when enabled in config)
 
