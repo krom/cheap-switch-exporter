@@ -6,11 +6,15 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -72,6 +76,20 @@ func resolveProfileConfig(pc ProfileConfig, settings GlobalSettings) ProfileConf
 		}
 	}
 	return pc
+}
+
+// validateProfileConfig checks a resolved profile's Profile/PoE combination is valid,
+// returning a descriptive error naming the profile if not.
+func validateProfileConfig(name string, pc ProfileConfig) error {
+	switch pc.Profile {
+	case "", "default", "v2":
+	default:
+		return fmt.Errorf("profile %q: invalid profile %q (must be \"\", \"default\", or \"v2\")", name, pc.Profile)
+	}
+	if pc.Profile == "v2" && pc.PoE == 1 {
+		return fmt.Errorf("profile %q: poe: 1 is not supported with profile: v2", name)
+	}
+	return nil
 }
 
 // ================= MODELS =================
@@ -286,13 +304,52 @@ func (c *PortStatsCollector) Collect(ch chan<- prometheus.Metric) {
 	c.lastScrape.Set(time.Since(start).Seconds())
 }
 
+// ================= SWITCH CLIENT =================
+
+// switchClient abstracts the per-profile fetch mechanics for one switch dialect, so
+// scrapeOnce doesn't need to know whether it's talking to the default cookie+HTML-scrape
+// dialect or the v2 JSON dialect.
+type switchClient interface {
+	FetchPorts() ([]Port, []PortStatus, error)
+	FetchPoE() (float64, []PoEPort, error)
+}
+
+// defaultClient wraps the original cookie+HTML-scrape fetch functions, unchanged.
+type defaultClient struct {
+	cfg ProfileConfig
+}
+
+func (c defaultClient) FetchPorts() ([]Port, []PortStatus, error) {
+	ports, err := fetchPorts(c.cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	status, _ := fetchPortStatus(c.cfg)
+	return ports, status, nil
+}
+
+func (c defaultClient) FetchPoE() (float64, []PoEPort, error) {
+	return fetchPoE(c.cfg)
+}
+
+// newSwitchClient resolves which dialect a profile uses (validated at startup in main(),
+// so the default case here is unreachable in practice).
+func newSwitchClient(name string, cfg ProfileConfig) switchClient {
+	if cfg.Profile == "v2" {
+		return v2Client{name: name, cfg: cfg}
+	}
+	return defaultClient{cfg: cfg}
+}
+
 // ================= BACKGROUND POLLING =================
 
-// scrapeOnce fetches fresh data for one profile and swaps it into st. On a fetchPorts
+// scrapeOnce fetches fresh data for one profile and swaps it into st. On a FetchPorts
 // failure, the previous successful snapshot (if any) is left in place and st.lastErr
 // records the failure, so Collect() keeps serving the last-known-good data.
 func scrapeOnce(profile NamedProfile, st *profileState, errs prometheus.Counter) {
-	ports, err := fetchPorts(profile.Config)
+	client := newSwitchClient(profile.Name, profile.Config)
+
+	ports, status, err := client.FetchPorts()
 	if err != nil {
 		errs.Inc()
 		st.mu.Lock()
@@ -300,12 +357,11 @@ func scrapeOnce(profile NamedProfile, st *profileState, errs prometheus.Counter)
 		st.mu.Unlock()
 		return
 	}
-	status, _ := fetchPortStatus(profile.Config)
 
 	var cons float64
 	var poePorts []PoEPort
 	if profile.Config.PoE == 1 {
-		cons, poePorts, _ = fetchPoE(profile.Config)
+		cons, poePorts, _ = client.FetchPoE()
 	}
 
 	st.mu.Lock()
@@ -449,6 +505,160 @@ func fetchPoE(cfg ProfileConfig) (float64, []PoEPort, error) {
 	return cons, ports, nil
 }
 
+// ================= V2 CLIENT =================
+
+// v2Client talks to the JSON-based "v2" device family (e.g. SKS3200-8E2X): a real login
+// call establishing a session, and a JSON status endpoint instead of HTML tables. It has
+// no PoE support (FetchPoE is a no-op), matching that this device family exposes no PoE
+// pages; profiles combining profile: v2 with poe: 1 are rejected at startup instead.
+type v2Client struct {
+	name string
+	cfg  ProfileConfig
+}
+
+// v2Login performs the v2 dialect's login (GET /authorize with the username and password
+// MD5-hashed separately) and returns the session cookies from its response. Per design,
+// this is called fresh on every FetchPorts call rather than cached/reused, since v2
+// sessions are short-lived.
+func v2Login(cfg ProfileConfig) ([]*http.Cookie, error) {
+	client := &http.Client{Timeout: time.Duration(cfg.Timeout) * time.Second}
+	req, _ := http.NewRequest("GET", "http://"+cfg.Address+"/authorize", nil)
+	req.URL.RawQuery = url.Values{
+		"loginusr": {md5hex(cfg.Username)},
+		"loginpwd": {md5hex(cfg.Password)},
+	}.Encode()
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return resp.Cookies(), nil
+}
+
+// v2PortJSON matches one port entry's shape within /port_statistics.json's response,
+// e.g. the "Port_1" value in {"PortNum":"10","Port_1":{...},...,"Port_10":{...}}.
+type v2PortJSON struct {
+	PortId     string `json:"Port_Id"`
+	PortStatus string `json:"Port_Status"`
+	LinkStatus string `json:"Link_Status"`
+	TxGoodPkt  string `json:"TxGoodPkt"`
+	TxBadPkt   string `json:"TxBadPkt"`
+	RxGoodPkt  string `json:"RxGoodPkt"`
+	RxBadPkt   string `json:"RxBadPkt"`
+}
+
+// linkStatusRe matches the v2 dialect's combined link-up/speed/duplex format, e.g.
+// "1000MbpsFull" or "10GbpsFull". "Link Down" is handled separately in parseLinkStatus.
+var linkStatusRe = regexp.MustCompile(`^(\d+)(Mbps|Gbps)(Full|Half)$`)
+
+// parseLinkStatus splits a v2 Link_Status string into link-up/down, speed (Mbps), and
+// duplex. ok is false if s doesn't match any recognized format (including documented-but-
+// unverified ones like Half duplex or 10Mbps/5000Mbps, which follow the same pattern but
+// have never been observed live).
+func parseLinkStatus(s string) (linkUp bool, speedMbps float64, fullDuplex bool, ok bool) {
+	s = strings.TrimSpace(s)
+	if s == "Link Down" {
+		return false, 0, false, true
+	}
+	m := linkStatusRe.FindStringSubmatch(s)
+	if m == nil {
+		return false, 0, false, false
+	}
+	n, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		return false, 0, false, false
+	}
+	if m[2] == "Gbps" {
+		n *= 1000
+	}
+	return true, n, m[3] == "Full", true
+}
+
+func (c v2Client) FetchPoE() (float64, []PoEPort, error) {
+	return 0, nil, nil
+}
+
+func (c v2Client) FetchPorts() ([]Port, []PortStatus, error) {
+	cookies, err := v2Login(c.cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	client := &http.Client{Timeout: time.Duration(c.cfg.Timeout) * time.Second}
+	req, _ := http.NewRequest("GET", "http://"+c.cfg.Address+"/port_statistics.json", nil)
+	for _, ck := range cookies {
+		req.AddCookie(ck)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, nil, err
+	}
+
+	// Iterate the actual "Port_N" keys present rather than trusting PortNum as a loop
+	// bound (PortNum could disagree with the keys actually present).
+	var keys []string
+	for k := range raw {
+		if strings.HasPrefix(k, "Port_") {
+			keys = append(keys, k)
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		ni, erri := strconv.Atoi(strings.TrimPrefix(keys[i], "Port_"))
+		nj, errj := strconv.Atoi(strings.TrimPrefix(keys[j], "Port_"))
+		if erri == nil && errj == nil {
+			return ni < nj
+		}
+		return keys[i] < keys[j]
+	})
+
+	var ports []Port
+	var statuses []PortStatus
+	for _, k := range keys {
+		var p v2PortJSON
+		if err := json.Unmarshal(raw[k], &p); err != nil {
+			continue
+		}
+		pt := Port{
+			Name:  p.PortId,
+			State: p.PortStatus,
+			Counters: map[CounterKind]float64{
+				TxGoodPkt: parseNum(p.TxGoodPkt),
+				TxBadPkt:  parseNum(p.TxBadPkt),
+				RxGoodPkt: parseNum(p.RxGoodPkt),
+				RxBadPkt:  parseNum(p.RxBadPkt),
+			},
+		}
+
+		linkUp, speedMbps, fullDuplex, ok := parseLinkStatus(p.LinkStatus)
+		if !ok {
+			log.Printf("v2 switch client: profile %q port %q: unrecognized Link_Status %q, omitting link/speed/duplex", c.name, pt.Name, p.LinkStatus)
+			ports = append(ports, pt)
+			continue
+		}
+
+		if linkUp {
+			pt.LinkStatus = "Link Up"
+		} else {
+			pt.LinkStatus = "Link Down"
+		}
+		ports = append(ports, pt)
+
+		fd := 0.0
+		if fullDuplex {
+			fd = 1
+		}
+		statuses = append(statuses, PortStatus{Name: pt.Name, SpeedMbps: speedMbps, FullDuplex: fd})
+	}
+
+	return ports, statuses, nil
+}
+
 // ================= HELPERS =================
 
 func state(s string) float64 {
@@ -544,7 +754,11 @@ func main() {
 	var profiles []NamedProfile
 	for _, m := range cfg.Profiles {
 		for name, pc := range m {
-			profiles = append(profiles, NamedProfile{Name: name, Config: resolveProfileConfig(pc, cfg.Settings)})
+			rc := resolveProfileConfig(pc, cfg.Settings)
+			if err := validateProfileConfig(name, rc); err != nil {
+				log.Fatal(err)
+			}
+			profiles = append(profiles, NamedProfile{Name: name, Config: rc})
 		}
 	}
 

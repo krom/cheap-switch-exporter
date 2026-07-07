@@ -21,6 +21,7 @@ Many budget-friendly network switches do not support standard SNMP monitoring. T
 | Horaco | HC-SWTGW124AS |  ✅ Verified | @arthurbarton |
 | KeepLink | KP-9000-9XHPML-X | ✅ Verified | @jfallot and @adamchabin |
 | Sodola | SL-SWTG124AS | ✅ Verified | @dennyreiter |
+| Anhui Seeker | SKS3200-8E2X | ✅ Verified (`profile: v2`) | - |
 
 ## 🚀 Installation
 
@@ -86,6 +87,14 @@ profiles:
       comments:
         Port 1: Uplink
 
+  - v2_switch:                     # a "v2"-dialect switch (e.g. SKS3200-8E2X): JSON status
+      profile: v2                  # endpoint + real login, instead of HTML+static cookie
+      address: "192.168.1.3"
+      username: "admin"
+      password: "password"
+      comments:                    # v2 port names are plain numbers (JSON "Port_Id"),
+        1: Uplink                  # not "Port 1"
+
 settings:                          # optional; defaults applied to any profile that
   poll_rate_seconds: 60            # doesn't set its own value (hardcoded defaults:
   timeout_seconds: 10              # 60s poll rate, 10s timeout, if omitted entirely)
@@ -96,6 +105,18 @@ Prometheus scrape), and `/metrics` is served from the most recently polled data 
 `timeout_seconds` bounds each individual request to that switch. Both values are resolved with
 the same precedence: the profile's own value, if set, else the global `settings` value, if set,
 else the hardcoded default.
+
+### `profile` (switch dialect)
+
+`profile` selects which switch dialect the exporter uses to talk to that entry's device:
+
+- Omitted, `""`, or `"default"` — the original dialect (stateless cookie auth, HTML tables).
+- `"v2"` — a second device family (e.g. `SKS3200-8E2X`) that logs in via a real session and
+  exposes port/counter data as JSON instead of HTML. PoE is not supported on this dialect;
+  `poe: 1` combined with `profile: v2` fails at startup.
+
+Any other value fails at startup. This is purely a per-profile scrape mechanism — metric
+names and labels are unaffected by which dialect a profile uses.
 
 ## 📊 Exposed Metrics
 
