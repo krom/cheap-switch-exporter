@@ -3,9 +3,7 @@
 Defines how the exporter scrapes switches using the "v2" dialect: a JSON-based API reached via
 an `/authorize` login request followed by a `/port_statistics.json` fetch, as an alternative to
 the existing cookie+HTML-scrape dialect.
-
 ## Requirements
-
 ### Requirement: v2 login before each scrape
 For a profile resolved to the `v2` dialect, the exporter SHALL perform a login request
 (`GET /authorize` with `loginusr`/`loginpwd` set to the MD5 hex digest of the username and
@@ -26,7 +24,10 @@ session SHALL NOT be cached or reused across scrapes.
 ### Requirement: v2 port and counter data from JSON
 For a profile resolved to the `v2` dialect, the exporter SHALL fetch `/port_statistics.json`
 and parse it as JSON (a map of dynamically-named `Port_N` keys, not an array) to populate
-per-port state and Tx/Rx good/bad packet counters, without any HTML parsing.
+per-port state and Tx/Rx good/bad packet counters, without any HTML parsing. The port name used
+for metric labels and `comments` config lookup SHALL be formatted as `"Port " + Port_Id` (e.g.
+`Port_Id: "1"` yields port name `"Port 1"`), matching the naming convention used by the default
+HTML dialect, rather than the bare `Port_Id` value.
 
 #### Scenario: Port fields map onto existing metrics
 - **WHEN** `/port_statistics.json` returns a port entry with `Port_Status: "Enabled"`,
@@ -40,6 +41,11 @@ per-port state and Tx/Rx good/bad packet counters, without any HTML parsing.
   prefixed keys actually present in the response
 - **THEN** the exporter emits metrics for the `Port_` keys actually present, not for a count
   derived from `PortNum`
+
+#### Scenario: Port name normalized to match default dialect
+- **WHEN** `/port_statistics.json` returns a port entry with `Port_Id: "1"`
+- **THEN** the exporter emits that port's `port` label, and looks up its `comments` config
+  entry, using the name `"Port 1"` (not the bare value `"1"`)
 
 ### Requirement: v2 Link_Status parsing
 For a profile resolved to the `v2` dialect, the exporter SHALL parse each port's
@@ -74,3 +80,4 @@ capability.
 #### Scenario: v2 profile never triggers PoE requests
 - **WHEN** a profile is resolved to the `v2` dialect
 - **THEN** the exporter makes no requests to any PoE-related endpoint for that profile
+

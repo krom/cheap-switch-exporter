@@ -408,7 +408,7 @@ func TestV2ClientFetchPorts(t *testing.T) {
 		t.Fatalf("got %d ports, want 10", len(ports))
 	}
 
-	port1 := portCounters(t, ports, "1")
+	port1 := portCounters(t, ports, "Port 1")
 	wantPort1 := map[CounterKind]float64{TxGoodPkt: 136463660, TxBadPkt: 0, RxGoodPkt: 208345310, RxBadPkt: 0}
 	if !reflect.DeepEqual(port1, wantPort1) {
 		t.Errorf("port 1 Counters = %v, want %v", port1, wantPort1)
@@ -418,24 +418,24 @@ func TestV2ClientFetchPorts(t *testing.T) {
 	for _, s := range statuses {
 		statusByName[s.Name] = s
 	}
-	if s := statusByName["1"]; s.SpeedMbps != 1000 || s.FullDuplex != 1 {
+	if s := statusByName["Port 1"]; s.SpeedMbps != 1000 || s.FullDuplex != 1 {
 		t.Errorf("port 1 status = %+v, want SpeedMbps=1000 FullDuplex=1", s)
 	}
-	if s := statusByName["9"]; s.SpeedMbps != 10000 || s.FullDuplex != 1 {
+	if s := statusByName["Port 9"]; s.SpeedMbps != 10000 || s.FullDuplex != 1 {
 		t.Errorf("port 9 status = %+v, want SpeedMbps=10000 FullDuplex=1", s)
 	}
-	if s, ok := statusByName["2"]; !ok || s.SpeedMbps != 0 || s.FullDuplex != 0 {
+	if s, ok := statusByName["Port 2"]; !ok || s.SpeedMbps != 0 || s.FullDuplex != 0 {
 		t.Errorf("port 2 (Link Down) status = %+v, ok=%v, want SpeedMbps=0 FullDuplex=0 ok=true", s, ok)
 	}
 
 	for _, p := range ports {
-		if p.Name == "1" && link(p.LinkStatus) != 1 {
+		if p.Name == "Port 1" && link(p.LinkStatus) != 1 {
 			t.Errorf("port 1 LinkStatus = %q, want link()==1", p.LinkStatus)
 		}
-		if p.Name == "2" && link(p.LinkStatus) != 0 {
+		if p.Name == "Port 2" && link(p.LinkStatus) != 0 {
 			t.Errorf("port 2 LinkStatus = %q, want link()==0", p.LinkStatus)
 		}
-		if p.Name == "1" && state(p.State) != 1 {
+		if p.Name == "Port 1" && state(p.State) != 1 {
 			t.Errorf("port 1 State = %q, want state()==1", p.State)
 		}
 	}

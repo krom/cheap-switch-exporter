@@ -625,7 +625,7 @@ func (c v2Client) FetchPorts() ([]Port, []PortStatus, error) {
 			continue
 		}
 		pt := Port{
-			Name:  p.PortId,
+			Name:  "Port " + p.PortId,
 			State: p.PortStatus,
 			Counters: map[CounterKind]float64{
 				TxGoodPkt: parseNum(p.TxGoodPkt),

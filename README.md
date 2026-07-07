@@ -92,8 +92,8 @@ profiles:
       address: "192.168.1.3"
       username: "admin"
       password: "password"
-      comments:                    # v2 port names are plain numbers (JSON "Port_Id"),
-        1: Uplink                  # not "Port 1"
+      comments:                    # v2 port names are normalized to "Port N" (from the
+        Port 1: Uplink             # JSON "Port_Id"), same as the default dialect
 
 settings:                          # optional; defaults applied to any profile that
   poll_rate_seconds: 60            # doesn't set its own value (hardcoded defaults:
