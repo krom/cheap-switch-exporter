@@ -53,6 +53,19 @@ go run main.go
 
 ### Docker Deployment
 
+Prebuilt images are published to [GHCR](https://github.com/krom/cheap-switch-exporter/pkgs/container/cheap-switch-exporter)
+for each tagged release:
+
+```bash
+# Pull the published image (or pin to a specific version, e.g. :v1.0.0)
+docker pull ghcr.io/krom/cheap-switch-exporter:latest
+
+# Run container
+docker run -v "./config.yaml:/config.yaml" -p 8080:8080 ghcr.io/krom/cheap-switch-exporter:latest
+```
+
+Alternatively, build the image locally:
+
 ```bash
 # Build Docker image
 docker build -t cheap-switch-exporter .

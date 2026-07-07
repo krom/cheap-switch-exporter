@@ -2,8 +2,8 @@
 FROM golang:1.23.5-alpine3.21 AS build
 
 # Set metadata and maintainer
-LABEL maintainer="Paolo Velati <paolo.velati@gmail.com>"
-LABEL org.opencontainers.image.source="https://github.com/pvelati/cheap-switch-exporter"
+LABEL maintainer="Paolo Velati <paolo.velati@gmail.com>, Roman Kudlay <roman@kudlay.pro>"
+LABEL org.opencontainers.image.source="https://github.com/krom/cheap-switch-exporter"
 LABEL org.opencontainers.image.description="Prometheus Exporter for cheap switch boxes without SNMP"
 
 # Install system dependencies
