@@ -18,9 +18,13 @@ profiles:
       username: "admin"
       password: "admin"
       timeout_seconds: 5
+      poll_rate_seconds: 30 # overrides settings.poll_rate_seconds for this profile only
       poe: 1
       comments:
         Port 1: Port 1
         Port 2: Port 2
         Port 3: Port 3
         Port 4: Port 4
+settings:
+  poll_rate_seconds: 10 # default for profiles without their own poll_rate_seconds
+  timeout_seconds: 5 # default for profiles without their own timeout_seconds

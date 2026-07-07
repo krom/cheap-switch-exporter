@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/hex"
 	"log"
@@ -27,21 +28,50 @@ import (
 
 type RootConfig struct {
 	Profiles []map[string]ProfileConfig `yaml:"profiles"`
+	Settings GlobalSettings             `yaml:"settings"`
+}
+
+// GlobalSettings provides defaults for poll_rate_seconds/timeout_seconds, applied to any
+// profile that doesn't set its own value (see main()'s resolution loop).
+type GlobalSettings struct {
+	PollRateSeconds int `yaml:"poll_rate_seconds"`
+	TimeoutSeconds  int `yaml:"timeout_seconds"`
 }
 
 type ProfileConfig struct {
-	Profile  string            `yaml:"profile"`
-	Address  string            `yaml:"address"`
-	Username string            `yaml:"username"`
-	Password string            `yaml:"password"`
-	Timeout  int               `yaml:"timeout_seconds"`
-	PoE      int               `yaml:"poe"`
-	Comments map[string]string `yaml:"comments"`
+	Profile         string            `yaml:"profile"`
+	Address         string            `yaml:"address"`
+	Username        string            `yaml:"username"`
+	Password        string            `yaml:"password"`
+	Timeout         int               `yaml:"timeout_seconds"`
+	PollRateSeconds int               `yaml:"poll_rate_seconds"`
+	PoE             int               `yaml:"poe"`
+	Comments        map[string]string `yaml:"comments"`
 }
 
 type NamedProfile struct {
 	Name   string
 	Config ProfileConfig
+}
+
+// resolveProfileConfig fills in a profile's Timeout/PollRateSeconds using the precedence
+// profile value -> global settings value -> hardcoded default (10s timeout, 60s poll rate).
+func resolveProfileConfig(pc ProfileConfig, settings GlobalSettings) ProfileConfig {
+	if pc.Timeout == 0 {
+		if settings.TimeoutSeconds != 0 {
+			pc.Timeout = settings.TimeoutSeconds
+		} else {
+			pc.Timeout = 10
+		}
+	}
+	if pc.PollRateSeconds == 0 {
+		if settings.PollRateSeconds != 0 {
+			pc.PollRateSeconds = settings.PollRateSeconds
+		} else {
+			pc.PollRateSeconds = 60
+		}
+	}
+	return pc
 }
 
 // ================= MODELS =================
@@ -110,10 +140,32 @@ type PoEPort struct {
 	Current float64
 }
 
+// ================= POLLING STATE =================
+
+// profileState holds the most recent successfully scraped data for one profile,
+// swapped in by that profile's background poller and read by Collect(). A nil
+// error means the last scrape succeeded; a non-nil error means the previous
+// successful snapshot (if any) is kept and served until the next successful poll.
+type profileState struct {
+	mu       sync.RWMutex
+	ports    []Port
+	status   []PortStatus
+	poeCons  float64
+	poePorts []PoEPort
+	lastErr  error
+}
+
+func (s *profileState) snapshot() ([]Port, []PortStatus, float64, []PoEPort, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.ports, s.status, s.poeCons, s.poePorts, s.lastErr
+}
+
 // ================= COLLECTOR =================
 
 type PortStatsCollector struct {
 	profiles []NamedProfile
+	states   map[string]*profileState
 
 	portState      *prometheus.Desc
 	portLink       *prometheus.Desc
@@ -131,8 +183,6 @@ type PortStatsCollector struct {
 
 	lastScrape prometheus.Gauge
 	errors     prometheus.Counter
-
-	mu sync.Mutex
 }
 
 func NewCollector(p []NamedProfile) *PortStatsCollector {
@@ -143,8 +193,14 @@ func NewCollector(p []NamedProfile) *PortStatsCollector {
 		portCounters[kind] = prometheus.NewDesc(name, counterMetricHelp[kind], labels, nil)
 	}
 
+	states := map[string]*profileState{}
+	for _, np := range p {
+		states[np.Name] = &profileState{}
+	}
+
 	return &PortStatsCollector{
 		profiles:       p,
+		states:         states,
 		portState:      prometheus.NewDesc("port_state", "Port admin state", labels, nil),
 		portLink:       prometheus.NewDesc("port_link_status", "Link up/down", labels, nil),
 		portCounters:   portCounters,
@@ -181,19 +237,16 @@ func (c *PortStatsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.poeCurr
 }
 
+// Collect reads each profile's cached snapshot rather than scraping live; background
+// pollProfile goroutines (started via StartPolling) are what keep those snapshots fresh.
 func (c *PortStatsCollector) Collect(ch chan<- prometheus.Metric) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	start := time.Now()
 
 	for _, p := range c.profiles {
-		ports, err := fetchPorts(p.Config)
-		if err != nil {
-			c.errors.Inc()
+		ports, status, cons, poePorts, err := c.states[p.Name].snapshot()
+		if err != nil && ports == nil {
 			continue
 		}
-		status, _ := fetchPortStatus(p.Config)
 		statusMap := map[string]PortStatus{}
 		for _, s := range status {
 			statusMap[s.Name] = s
@@ -215,25 +268,79 @@ func (c *PortStatsCollector) Collect(ch chan<- prometheus.Metric) {
 			}
 		}
 
-		if p.Config.PoE == 1 {
-			cons, poePorts, err := fetchPoE(p.Config)
-			if err == nil {
-				ch <- prometheus.MustNewConstMetric(c.poeSystem, prometheus.GaugeValue, cons)
-				for _, pp := range poePorts {
-					comment := p.Config.Comments[pp.Name]
-					labels := []string{pp.Name, comment, p.Name, p.Config.Address}
-					ch <- prometheus.MustNewConstMetric(c.poeState, prometheus.GaugeValue, pp.State, labels...)
-					ch <- prometheus.MustNewConstMetric(c.poePower, prometheus.GaugeValue, pp.Power, labels...)
-					ch <- prometheus.MustNewConstMetric(c.poeType, prometheus.GaugeValue, pp.Type, labels...)
-					ch <- prometheus.MustNewConstMetric(c.poeWatts, prometheus.GaugeValue, pp.Watts, labels...)
-					ch <- prometheus.MustNewConstMetric(c.poeVolt, prometheus.GaugeValue, pp.Voltage, labels...)
-					ch <- prometheus.MustNewConstMetric(c.poeCurr, prometheus.GaugeValue, pp.Current, labels...)
-				}
+		if p.Config.PoE == 1 && poePorts != nil {
+			ch <- prometheus.MustNewConstMetric(c.poeSystem, prometheus.GaugeValue, cons)
+			for _, pp := range poePorts {
+				comment := p.Config.Comments[pp.Name]
+				labels := []string{pp.Name, comment, p.Name, p.Config.Address}
+				ch <- prometheus.MustNewConstMetric(c.poeState, prometheus.GaugeValue, pp.State, labels...)
+				ch <- prometheus.MustNewConstMetric(c.poePower, prometheus.GaugeValue, pp.Power, labels...)
+				ch <- prometheus.MustNewConstMetric(c.poeType, prometheus.GaugeValue, pp.Type, labels...)
+				ch <- prometheus.MustNewConstMetric(c.poeWatts, prometheus.GaugeValue, pp.Watts, labels...)
+				ch <- prometheus.MustNewConstMetric(c.poeVolt, prometheus.GaugeValue, pp.Voltage, labels...)
+				ch <- prometheus.MustNewConstMetric(c.poeCurr, prometheus.GaugeValue, pp.Current, labels...)
 			}
 		}
 	}
 
 	c.lastScrape.Set(time.Since(start).Seconds())
+}
+
+// ================= BACKGROUND POLLING =================
+
+// scrapeOnce fetches fresh data for one profile and swaps it into st. On a fetchPorts
+// failure, the previous successful snapshot (if any) is left in place and st.lastErr
+// records the failure, so Collect() keeps serving the last-known-good data.
+func scrapeOnce(profile NamedProfile, st *profileState, errs prometheus.Counter) {
+	ports, err := fetchPorts(profile.Config)
+	if err != nil {
+		errs.Inc()
+		st.mu.Lock()
+		st.lastErr = err
+		st.mu.Unlock()
+		return
+	}
+	status, _ := fetchPortStatus(profile.Config)
+
+	var cons float64
+	var poePorts []PoEPort
+	if profile.Config.PoE == 1 {
+		cons, poePorts, _ = fetchPoE(profile.Config)
+	}
+
+	st.mu.Lock()
+	st.ports = ports
+	st.status = status
+	st.poeCons = cons
+	st.poePorts = poePorts
+	st.lastErr = nil
+	st.mu.Unlock()
+}
+
+// pollProfile scrapes profile immediately, then again on every tick of interval, until
+// ctx is cancelled.
+func pollProfile(ctx context.Context, profile NamedProfile, st *profileState, interval time.Duration, errs prometheus.Counter) {
+	scrapeOnce(profile, st, errs)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			scrapeOnce(profile, st, errs)
+		}
+	}
+}
+
+// StartPolling launches one background poller goroutine per profile, each scraping on
+// its own resolved PollRateSeconds interval, until ctx is cancelled.
+func (c *PortStatsCollector) StartPolling(ctx context.Context) {
+	for _, p := range c.profiles {
+		interval := time.Duration(p.Config.PollRateSeconds) * time.Second
+		go pollProfile(ctx, p, c.states[p.Name], interval, c.errors)
+	}
 }
 
 // ================= FETCH / PARSE =================
@@ -437,15 +544,15 @@ func main() {
 	var profiles []NamedProfile
 	for _, m := range cfg.Profiles {
 		for name, pc := range m {
-			if pc.Timeout == 0 {
-				pc.Timeout = 5
-			}
-			profiles = append(profiles, NamedProfile{Name: name, Config: pc})
+			profiles = append(profiles, NamedProfile{Name: name, Config: resolveProfileConfig(pc, cfg.Settings)})
 		}
 	}
 
 	collector := NewCollector(profiles)
 	prometheus.MustRegister(collector)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	collector.StartPolling(ctx)
 
 	http.Handle("/metrics", promhttp.Handler())
 	go http.ListenAndServe(":8080", nil)
@@ -453,4 +560,5 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
+	cancel()
 }

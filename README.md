@@ -70,7 +70,8 @@ profiles:
       address: "192.168.1.1"       # IP or hostname of the switch
       username: "admin"            # Web interface username
       password: "password"         # Web interface password
-      timeout_seconds: 5           # Request timeout (defaults to 5 if omitted)
+      timeout_seconds: 5           # Per-request timeout, overrides settings.timeout_seconds
+      poll_rate_seconds: 30        # Poll interval, overrides settings.poll_rate_seconds
       poe: 0                       # Enable PoE page scrape (1 = enabled)
       comments:                    # Optional per-port labels, keyed by port name
         Port 1: Port 1
@@ -81,11 +82,20 @@ profiles:
       address: "192.168.1.2"
       username: "admin"
       password: "password"
-      timeout_seconds: 5
       poe: 1
       comments:
         Port 1: Uplink
+
+settings:                          # optional; defaults applied to any profile that
+  poll_rate_seconds: 60            # doesn't set its own value (hardcoded defaults:
+  timeout_seconds: 10              # 60s poll rate, 10s timeout, if omitted entirely)
 ```
+
+Each switch is polled in the background on its own `poll_rate_seconds` interval (not on every
+Prometheus scrape), and `/metrics` is served from the most recently polled data in memory.
+`timeout_seconds` bounds each individual request to that switch. Both values are resolved with
+the same precedence: the profile's own value, if set, else the global `settings` value, if set,
+else the hardcoded default.
 
 ## 📊 Exposed Metrics
 
