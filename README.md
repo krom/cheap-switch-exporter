@@ -60,8 +60,8 @@ for each tagged release:
 # Pull the published image
 docker pull ghcr.io/krom/cheap-switch-exporter:latest
 
-# Or pin to a specific released version
-docker pull ghcr.io/krom/cheap-switch-exporter:v1.0.0
+# Or pin to a specific version - major (1), major.minor (1.0), or full (1.0.0)
+docker pull ghcr.io/krom/cheap-switch-exporter:1
 
 # Run container
 docker run -v "./config.yaml:/config.yaml" -p 8080:8080 ghcr.io/krom/cheap-switch-exporter:latest
