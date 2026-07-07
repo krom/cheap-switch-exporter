@@ -26,7 +26,9 @@
 ## 4. Verification
 
 - [x] 4.1 Validate the workflow YAML (e.g. `actionlint` or GitHub's workflow syntax check).
-- [ ] 4.2 Push a test version tag (e.g. `v0.0.1-test`) and confirm the workflow runs and publishes
+- [x] 4.2 Push a test version tag (e.g. `v0.0.1-test`) and confirm the workflow runs and publishes
       an image to GHCR tagged with that version; confirm a plain push to `main` does NOT trigger it.
+      Verified: run 28896274348 completed successfully (build+push green) after fixing the
+      Dockerfile's Go base image version mismatch.
 - [ ] 4.3 One-time manual step: set the new GHCR package visibility to public in GitHub package
       settings so `docker pull` works without authentication.
