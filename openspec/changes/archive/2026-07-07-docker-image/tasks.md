@@ -30,5 +30,8 @@
       an image to GHCR tagged with that version; confirm a plain push to `main` does NOT trigger it.
       Verified: run 28896274348 completed successfully (build+push green) after fixing the
       Dockerfile's Go base image version mismatch.
-- [ ] 4.3 One-time manual step: set the new GHCR package visibility to public in GitHub package
+- [x] 4.3 One-time manual step: set the new GHCR package visibility to public in GitHub package
       settings so `docker pull` works without authentication.
+      Verified: package settings already show "This package is currently public" (no action
+      needed — public repo's first-published package defaulted to public), and an anonymous
+      `docker pull ghcr.io/krom/cheap-switch-exporter:latest` succeeds without `docker login`.
