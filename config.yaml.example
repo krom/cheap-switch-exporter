@@ -31,7 +31,7 @@ profiles:
       username: "admin"
       password: "admin"
       comments:
-        1: Uplink
+        Port 1: Uplink
 settings:
   poll_rate_seconds: 10 # default for profiles without their own poll_rate_seconds
   timeout_seconds: 5 # default for profiles without their own timeout_seconds

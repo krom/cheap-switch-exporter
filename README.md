@@ -21,7 +21,9 @@ Many budget-friendly network switches do not support standard SNMP monitoring. T
 | Horaco | HC-SWTGW124AS |  ✅ Verified | @arthurbarton |
 | KeepLink | KP-9000-9XHPML-X | ✅ Verified | @jfallot and @adamchabin |
 | Sodola | SL-SWTG124AS | ✅ Verified | @dennyreiter |
-| Anhui Seeker | SKS3200-8E2X | ✅ Verified (`profile: v2`) | - |
+| XikeStor / Anhui Seeker | SKS3200-8E2X | ✅ Verified (`profile: v2`) | @krom |
+| XikeStor | SKS3200-8E1X-P | ✅ Verified | @krom |
+| XikeStor | SKS3200-4E2X | ✅ Verified | @krom |
 
 ## 🚀 Installation
 
@@ -106,6 +108,7 @@ Prometheus scrape), and `/metrics` is served from the most recently polled data 
 the same precedence: the profile's own value, if set, else the global `settings` value, if set,
 else the hardcoded default.
 
+
 ### `profile` (switch dialect)
 
 `profile` selects which switch dialect the exporter uses to talk to that entry's device:
@@ -114,6 +117,14 @@ else the hardcoded default.
 - `"v2"` — a second device family (e.g. `SKS3200-8E2X`) that logs in via a real session and
   exposes port/counter data as JSON instead of HTML. PoE is not supported on this dialect;
   `poe: 1` combined with `profile: v2` fails at startup.
+
+#### Default dialect (profile omitted or "default")
+
+![Default dialect example](img/v1.png)
+
+#### v2 dialect (profile: v2)
+
+![v2 dialect example](img/v2.png)
 
 Any other value fails at startup. This is purely a per-profile scrape mechanism — metric
 names and labels are unaffected by which dialect a profile uses.
