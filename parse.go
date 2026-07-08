@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/md5"
 	"encoding/hex"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -62,6 +63,31 @@ func speed(s string) float64 {
 		return 10000
 	}
 	return 0
+}
+
+var speedDuplexRe = regexp.MustCompile(`^(\d+)(G)?(Full|Half)$`)
+
+// parseSpeedDuplex parses a switch's merged Speed/Duplex "Actual" cell (e.g. "1000Full",
+// "10GFull", "10Half"), as seen on models that combine speed and duplex into one column
+// instead of the separate Duplex/Speed columns speed()/duplex() handle. A "G" suffix means
+// the number is Gbps (converted to Mbps); no suffix means the number is already Mbps.
+// "Link Down" and any other unrecognized text yield 0, 0.
+func parseSpeedDuplex(s string) (speedMbps float64, fullDuplex float64) {
+	m := speedDuplexRe.FindStringSubmatch(strings.TrimSpace(s))
+	if m == nil {
+		return 0, 0
+	}
+	n, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		return 0, 0
+	}
+	if m[2] == "G" {
+		n *= 1000
+	}
+	if m[3] == "Full" {
+		fullDuplex = 1
+	}
+	return n, fullDuplex
 }
 
 // parseNum parses a table cell's numeric text. Some switch firmware splits a 64-bit

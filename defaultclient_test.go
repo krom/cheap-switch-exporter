@@ -87,9 +87,41 @@ func TestFetchPorts_MixedPacketAndByteLayout(t *testing.T) {
 	}
 }
 
-func TestFetchPortStatus(t *testing.T) {
+func TestFetchPortStatus_SeparateDuplexSpeedGroups(t *testing.T) {
 	_, cfg := newFixtureServer(t, map[string]string{
-		"/port.cgi?page=status": "testdata/port_status.html",
+		"/port.cgi?page=status": "examples/sks3200-5e1x_port_status.html",
+	})
+
+	got, err := fetchPortStatus(cfg)
+	if err != nil {
+		t.Fatalf("fetchPortStatus: %v", err)
+	}
+
+	want := map[string]PortStatus{
+		"Port 1": {Name: "Port 1", SpeedMbps: 10, FullDuplex: 0},
+		"Port 2": {Name: "Port 2", SpeedMbps: 10, FullDuplex: 0},
+		"Port 3": {Name: "Port 3", SpeedMbps: 10, FullDuplex: 0},
+		"Port 4": {Name: "Port 4", SpeedMbps: 10, FullDuplex: 0},
+		"Port 5": {Name: "Port 5", SpeedMbps: 10, FullDuplex: 0},
+		"Port 6": {Name: "Port 6", SpeedMbps: 10000, FullDuplex: 1},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d statuses, want %d", len(got), len(want))
+	}
+	for _, s := range got {
+		w, ok := want[s.Name]
+		if !ok {
+			t.Fatalf("unexpected port %q", s.Name)
+		}
+		if s != w {
+			t.Errorf("%s: got %+v, want %+v", s.Name, s, w)
+		}
+	}
+}
+
+func TestFetchPortStatus_MergedSpeedDuplexGroup(t *testing.T) {
+	_, cfg := newFixtureServer(t, map[string]string{
+		"/port.cgi?page=status": "examples/sks3200-8e1x-p_port_status.html",
 	})
 
 	got, err := fetchPortStatus(cfg)
@@ -99,8 +131,14 @@ func TestFetchPortStatus(t *testing.T) {
 
 	want := map[string]PortStatus{
 		"Port 1": {Name: "Port 1", SpeedMbps: 1000, FullDuplex: 1},
-		"Port 2": {Name: "Port 2", SpeedMbps: 100, FullDuplex: 0},
-		"Port 3": {Name: "Port 3", SpeedMbps: 10000, FullDuplex: 1},
+		"Port 2": {Name: "Port 2", SpeedMbps: 1000, FullDuplex: 1},
+		"Port 3": {Name: "Port 3", SpeedMbps: 1000, FullDuplex: 1},
+		"Port 4": {Name: "Port 4", SpeedMbps: 2500, FullDuplex: 1},
+		"Port 5": {Name: "Port 5", SpeedMbps: 0, FullDuplex: 0},
+		"Port 6": {Name: "Port 6", SpeedMbps: 2500, FullDuplex: 1},
+		"Port 7": {Name: "Port 7", SpeedMbps: 0, FullDuplex: 0},
+		"Port 8": {Name: "Port 8", SpeedMbps: 0, FullDuplex: 0},
+		"Port 9": {Name: "Port 9", SpeedMbps: 10000, FullDuplex: 1},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("got %d statuses, want %d", len(got), len(want))

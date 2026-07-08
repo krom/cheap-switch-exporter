@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -81,25 +82,72 @@ func fetchPorts(cfg ProfileConfig) ([]Port, error) {
 	return res, nil
 }
 
+// speedDuplexColumns locates, within a port.cgi?page=status data table's group-header row,
+// which data column holds the live Duplex/Speed value(s). Two real layouts are known: one
+// with separate "Duplex Mode" and "Negotiation Speed" colspan-2 groups, and one with a single
+// merged "Speed/Duplex" colspan-2 group. Each group's second (colspan) column is its "Actual"
+// value; the first is the configured target and is not used here.
+type speedDuplexColumns struct {
+	duplexActual      int
+	speedActual       int
+	speedDuplexActual int
+	merged            bool
+	found             bool
+}
+
+func findSpeedDuplexColumns(headerRow *goquery.Selection) speedDuplexColumns {
+	var cols speedDuplexColumns
+	offset := 0
+	headerRow.Find("th").Each(func(_ int, th *goquery.Selection) {
+		label := strings.TrimSpace(th.Text())
+		span := 1
+		if cs, ok := th.Attr("colspan"); ok {
+			if n, err := strconv.Atoi(cs); err == nil && n > 0 {
+				span = n
+			}
+		}
+		switch label {
+		case "Duplex Mode":
+			cols.duplexActual = offset + span - 1
+			cols.found = true
+		case "Negotiation Speed":
+			cols.speedActual = offset + span - 1
+			cols.found = true
+		case "Speed/Duplex":
+			cols.speedDuplexActual = offset + span - 1
+			cols.merged = true
+			cols.found = true
+		}
+		offset += span
+	})
+	return cols
+}
+
 func fetchPortStatus(cfg ProfileConfig) ([]PortStatus, error) {
 	doc, err := fetchDoc(cfg, "/port.cgi", "status")
 	if err != nil {
 		return nil, fmt.Errorf("fetch port status: %w", err)
 	}
+
+	dataTable := doc.Find("table").Last()
+	cols := findSpeedDuplexColumns(dataTable.Find("tr").First())
+
 	var res []PortStatus
-	doc.Find("table tr").Each(func(i int, s *goquery.Selection) {
-		if i == 0 {
-			return
-		}
+	dataTable.Find("tr").Each(func(_ int, s *goquery.Selection) {
 		tds := s.Find("td")
-		if tds.Length() < 6 {
+		if tds.Length() == 0 {
 			return
 		}
-		res = append(res, PortStatus{
-			Name:       tds.Eq(0).Text(),
-			SpeedMbps:  speed(tds.Eq(5).Text()),
-			FullDuplex: duplex(tds.Eq(3).Text()),
-		})
+		ps := PortStatus{Name: tds.Eq(0).Text()}
+		if cols.found {
+			if cols.merged {
+				ps.SpeedMbps, ps.FullDuplex = parseSpeedDuplex(tds.Eq(cols.speedDuplexActual).Text())
+			} else {
+				ps.SpeedMbps = speed(tds.Eq(cols.speedActual).Text())
+				ps.FullDuplex = duplex(tds.Eq(cols.duplexActual).Text())
+			}
+		}
+		res = append(res, ps)
 	})
 	return res, nil
 }

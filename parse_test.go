@@ -105,6 +105,27 @@ func TestSpeed(t *testing.T) {
 	}
 }
 
+func TestParseSpeedDuplex(t *testing.T) {
+	cases := []struct {
+		in         string
+		wantSpeed  float64
+		wantDuplex float64
+	}{
+		{"1000Full", 1000, 1},
+		{"2500Full", 2500, 1},
+		{"10GFull", 10000, 1},
+		{"10Half", 10, 0},
+		{"Link Down", 0, 0},
+		{"Unknown", 0, 0},
+	}
+	for _, c := range cases {
+		gotSpeed, gotDuplex := parseSpeedDuplex(c.in)
+		if gotSpeed != c.wantSpeed || gotDuplex != c.wantDuplex {
+			t.Errorf("parseSpeedDuplex(%q) = (%v, %v), want (%v, %v)", c.in, gotSpeed, gotDuplex, c.wantSpeed, c.wantDuplex)
+		}
+	}
+}
+
 func TestParseNum(t *testing.T) {
 	cases := []struct {
 		in   string
